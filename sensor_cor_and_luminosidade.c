@@ -3,6 +3,9 @@
 #include <math.h>     // fmaxf, fminf
 #include "pico/stdlib.h"
 #include "hardware/i2c.h"
+#include "hardware/pio.h"
+#include "hardware/clocks.h"
+#include "animacoes_led.pio.h" // Animações LEDs PIO
 #include "bh1750_light_sensor.h"
 #include "lib/config_btn.h"
 
@@ -11,7 +14,56 @@
 #define I2C_SDA  0
 #define I2C_SCL  1
 
-// EndereÃ§os
+// ====================== Matriz de Leds ======================
+#define NUM_PIXELS 25          // Número de LEDs na matriz
+#define matriz_leds 7          // Pino de saída para matriz
+
+// ====================== Definição de Pinos ======================
+const uint BTN_A_PIN = 5;  // Pino para o BotÃ£o A
+const uint RED_PIN = 13;   // Pino para o LED vermelho
+const uint GREEN_PIN = 11; // Pino para o LED verde
+const uint BLUE_PIN = 12;  // Pino para o LED azul
+
+// ====================== Variáveis Globais ======================
+PIO pio;                      // Controlador PIO
+uint sm;                      // State Machine do PIO
+uint contagem = 0;            // Número a ser exibido na matriz
+uint16_t r, g, b, c;
+uint16_t rp, gp, bp;
+
+// ====================== Variáveis de Controle ======================
+volatile int led_state = 0;            // 0=Vermelho, 1=Verde, 2=Azul
+volatile uint32_t last_press_time = 0; // Armazena o tempo do Ãºltimo aperto para o debounce
+
+// ====================== Interrupção Botão A ======================
+void bta_gpio_irq_handler(uint gpio, uint32_t events)
+{
+    // Verifica se o botão A foi presionado
+    if (gpio == BTN_A_PIN)
+    {
+
+        // Pega o tempo atual em milissegundos
+        uint32_t current_time = to_ms_since_boot(get_absolute_time());
+
+        // LÃ³gica de Debounce: Ignora o aperto se ocorreu muito rÃ¡pido (menos de 250ms)
+        if (current_time - last_press_time > 250)
+        {
+            // Atualiza o tempo do Ãºltimo aperto vÃ¡lido
+            last_press_time = current_time;
+
+            // AvanÃ§a para o prÃ³ximo estado do LED
+            led_state++;
+
+            // Se passar do Ãºltimo estado (azul), volta para o primeiro (vermelho)
+            if (led_state > 4)
+            {
+                led_state = 0;
+            }
+        }
+    }
+}
+
+// Endereços
 #define BH1750_ADDR 0x23
 #define GY33_ADDR   0x29
 
@@ -111,12 +163,63 @@ static void gy33_read_raw(uint16_t* r, uint16_t* g, uint16_t* b, uint16_t* c) {
     *b = gy33_read_register16(BDATA_REG);
 }
 
+// Função para converter RGB decimal para uint32_t no formato RGBA
+    uint32_t rgb_para_hex(int R, int G, int B, int P) {
+        // Garante que os valores estão no range 0-255
+        R = (R < 0) ? 0 : (R > 255) ? 255 : R;
+        G = (G < 0) ? 0 : (G > 255) ? 255 : G;
+        B = (B < 0) ? 0 : (B > 255) ? 255 : B;
+        P = (P < 0) ? 0 : (P > 255) ? 255 : P;
+    
+        // Combina os bytes: R(bits 31-24) G(bits 23-16) B(bits 15-8) A(bits 7-0)
+        return ((uint32_t)G << 24) | ((uint32_t)R << 16) | ((uint32_t)B << 8) | (uint32_t)P;
+    }
+
+// Função que muda a cor da matriz de Leds
+void Cores_matriz_leds(){
+
+    rp = (uint16_t) rgb_r16 * (lux_val / 2000.0);
+    gp = (uint16_t) rgb_g16 * (lux_val / 2000.0);
+    bp = (uint16_t) rgb_b16 * (lux_val / 2000.0);
+
+    // Converte as cores em RGB
+    uint32_t cor_rgb = rgb_para_hex(rp, gp, bp, 0);
+    
+    for (int i = 0; i < NUM_PIXELS; i++) {
+           
+        pio_sm_put_blocking(pio, sm, cor_rgb);
+    }
+}
+
 // ================== Main ==================
 int main() {
     stdio_init_all();
     sleep_ms(50);
 
     init_btn_callback();
+
+    // Configurações dos pinos GPIO do LED RGB
+    gpio_init(RED_PIN);
+    gpio_init(GREEN_PIN);
+    gpio_init(BLUE_PIN);
+
+    gpio_set_dir(RED_PIN, GPIO_OUT);
+    gpio_set_dir(GREEN_PIN, GPIO_OUT);
+    gpio_set_dir(BLUE_PIN, GPIO_OUT);
+
+    // --- Inicialização do Pino do Botão ---
+    gpio_init(BTN_A_PIN);
+    gpio_set_dir(BTN_A_PIN, GPIO_IN);
+    gpio_pull_up(BTN_A_PIN); // Usa o resistor de pull-up interno
+
+    // --- ConfiguraÃ§Ã£o da Interrupção ---
+    gpio_set_irq_enabled_with_callback(BTN_A_PIN, GPIO_IRQ_EDGE_FALL, true, &bta_gpio_irq_handler);
+
+    // Inicialização PIO para matriz de LEDs
+    pio = pio0;
+    uint offset = pio_add_program(pio, &animacoes_led_program);
+    sm = pio_claim_unused_sm(pio, true);
+    animacoes_led_program_init(pio, sm, offset, matriz_leds);
 
     // I2C0 a 400kHz
     i2c_init(I2C_PORT, 400 * 1000);
@@ -131,10 +234,45 @@ int main() {
 
     sleep_ms(200);
 
-    // CabeÃ§alho CSV opcional
+    // Cabeçalho CSV opcional
     printf("timestamp_ms,lux,r16,g16,b16,c16,r8,g8,b8,color\n");
 
     while (true) {
+
+        // Ligar a matriz de acordo a cor detectada
+        Cores_matriz_leds();
+
+        // Mudar as cores exibidadas no led RGB
+        if (led_state == 0)
+        { // Estado 0: Ligar Vermelho
+            gpio_put(RED_PIN, 1);
+            gpio_put(GREEN_PIN, 0);
+            gpio_put(BLUE_PIN, 0);
+        }
+        else if (led_state == 1)
+        { // Estado 1: Ligar Amarelo
+            gpio_put(RED_PIN, 1);
+            gpio_put(GREEN_PIN, 1);
+            gpio_put(BLUE_PIN, 0);
+        }        
+        else if (led_state == 2)
+        { // Estado 1: Ligar Verde
+            gpio_put(RED_PIN, 0);
+            gpio_put(GREEN_PIN, 1);
+            gpio_put(BLUE_PIN, 0);
+        }
+        else if (led_state == 3)
+        { // Estado 2: Ligar Azul
+            gpio_put(RED_PIN, 0);
+            gpio_put(GREEN_PIN, 0);
+            gpio_put(BLUE_PIN, 1);
+        } else 
+        { // Estado 2: Ligar rosa
+            gpio_put(RED_PIN, 1);
+            gpio_put(GREEN_PIN, 0);
+            gpio_put(BLUE_PIN, 1);
+        }
+        
         // BH1750
         lux_val = bh1750_read_measurement(I2C_PORT);
 

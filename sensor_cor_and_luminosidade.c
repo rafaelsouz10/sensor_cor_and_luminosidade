@@ -7,11 +7,19 @@
 #include "hardware/pwm.h"    // <— novo (buzzer)
 #include "bh1750_light_sensor.h"
 #include "lib/config_btn.h"
+#include "lib/ssd1306/font.h"
+#include "lib/ssd1306/ssd1306.h"
 
 // ====================== I2C ======================
 #define I2C_PORT i2c0
 #define I2C_SDA  0
 #define I2C_SCL  1
+
+// ====================== I2C1 (DISPLAY) ======================
+
+#define I2C_PORT_DISPLAY i2c1
+#define I2C_DISPLAY_SDA 14
+#define I2C_DISPLAY_SCL 15
 
 // Endereços
 #define BH1750_ADDR 0x23
@@ -36,6 +44,7 @@ volatile uint16_t rgb_r16 = 0, rgb_g16 = 0, rgb_b16 = 0, rgb_c16 = 0;
 volatile uint8_t  rgb_r8 = 0, rgb_g8 = 0, rgb_b8 = 0; // normalizado por (R+G+B)
 volatile uint16_t lux_val = 0;
 volatile char cor_nome[12] = "Indefinido";
+ssd1306_t ssd;
 
 // ================== Utils ==================
 static inline uint8_t clamp_u8(int v) {
@@ -175,12 +184,26 @@ int main() {
     gpio_pull_up(I2C_SDA);
     gpio_pull_up(I2C_SCL);
 
+    // I2C1 DISPLAY
+    i2c_init(I2C_PORT_DISPLAY, 400 * 1000);
+    gpio_set_function(I2C_DISPLAY_SDA, GPIO_FUNC_I2C);
+    gpio_set_function(I2C_DISPLAY_SCL, GPIO_FUNC_I2C);
+    gpio_pull_up(I2C_DISPLAY_SDA);
+    gpio_pull_up(I2C_DISPLAY_SCL);
+
     // Sensores
     bh1750_power_on(I2C_PORT);
     gy33_init();
 
+
     // Buzzer
     init_pwm(BUZZER);
+
+    // DISPLAY
+    ssd1306_init(&ssd, 128, 64, false, 0x3C, I2C_PORT_DISPLAY);
+    ssd1306_config(&ssd);
+    ssd1306_fill(&ssd, 0);
+    ssd1306_send_data(&ssd);
 
     sleep_ms(200);
 
@@ -252,6 +275,30 @@ int main() {
                rgb_r8, rgb_g8, rgb_b8, cor_nome);
 
         sleep_ms(200);
+    
+        //Leitura sensores
+        uint16_t lux_val = bh1750_read_measurement(I2C_PORT);
+
+        uint16_t r, g, b, c;
+        gy33_read_raw(&r, &g, &b, &c);
+
+        //Display
+        ssd1306_fill(&ssd, 0);
+        char buf[32];
+
+        snprintf(buf, sizeof(buf), "Lux: %u lx", lux_val);
+        ssd1306_draw_string(&ssd, buf, 0, 0);
+        snprintf(buf, sizeof(buf), "R:%u G:%u", r, g);
+        ssd1306_draw_string(&ssd, buf, 0, 16);
+        snprintf(buf, sizeof(buf), "B:%u", b);
+        ssd1306_draw_string(&ssd, buf, 0, 28);
+        snprintf(buf, sizeof(buf), "Cor: %s", cor_nome);
+        ssd1306_draw_string(&ssd, buf, 0, 44);
+        ssd1306_send_data(&ssd);
+
+        sleep_ms(500);
     }
+
+    
     return 0;
-}
+}   

@@ -3,6 +3,8 @@
 #include <math.h>     // fmaxf, fminf
 #include "pico/stdlib.h"
 #include "hardware/i2c.h"
+#include "hardware/gpio.h"   // <— novo (buzzer)
+#include "hardware/pwm.h"    // <— novo (buzzer)
 #include "bh1750_light_sensor.h"
 #include "lib/config_btn.h"
 
@@ -23,6 +25,11 @@
 #define RDATA_REG    0x96
 #define GDATA_REG    0x98
 #define BDATA_REG    0x9A
+
+// ================== Buzzer (PWM) ==================
+#define BUZZER      21
+#define LUX_LIMIT   15     // limite para alerta de baixa luz (ajuste conforme seu ambiente)
+#define LUX_HYST    3      // histerese para sair do estado de alerta
 
 // ================== Variáveis globais ==================
 volatile uint16_t rgb_r16 = 0, rgb_g16 = 0, rgb_b16 = 0, rgb_c16 = 0;
@@ -111,6 +118,49 @@ static void gy33_read_raw(uint16_t* r, uint16_t* g, uint16_t* b, uint16_t* c) {
     *b = gy33_read_register16(BDATA_REG);
 }
 
+// ================== Buzzer: funções PWM ==================
+static void init_pwm(uint gpio) {
+    gpio_set_function(gpio, GPIO_FUNC_PWM);
+    uint slice_num = pwm_gpio_to_slice_num(gpio);
+    pwm_set_clkdiv(slice_num, 125.0f);        // base 1 MHz
+    pwm_set_wrap(slice_num, 1000);            // TOP 1000 => 1 kHz default
+    pwm_set_chan_level(slice_num, pwm_gpio_to_channel(gpio), 0);
+    pwm_set_enabled(slice_num, true);
+}
+
+static void set_buzzer_tone(uint gpio, uint freq) {
+    uint slice_num = pwm_gpio_to_slice_num(gpio);
+    if (freq == 0) { // proteção
+        pwm_set_chan_level(slice_num, pwm_gpio_to_channel(gpio), 0);
+        return;
+    }
+    uint top = 1000000 / freq;                // 1 MHz / freq
+    if (top < 10) top = 10;                   // evita TOP muito baixo
+    pwm_set_wrap(slice_num, top);
+    pwm_set_chan_level(slice_num, pwm_gpio_to_channel(gpio), top / 2); // 50% duty
+}
+
+static void stop_buzzer(uint gpio) {
+    uint slice_num = pwm_gpio_to_slice_num(gpio);
+    pwm_set_chan_level(slice_num, pwm_gpio_to_channel(gpio), 0);
+}
+
+// pequenos helpers de padrão sonoro (bloqueantes, curtos)
+static void beep_once(uint gpio, uint freq, uint ms) {
+    set_buzzer_tone(gpio, freq);
+    sleep_ms(ms);
+    stop_buzzer(gpio);
+}
+
+static void beep_triple(uint gpio, uint freq, uint on_ms, uint off_ms) {
+    for (int i = 0; i < 3; i++) {
+        set_buzzer_tone(gpio, freq);
+        sleep_ms(on_ms);
+        stop_buzzer(gpio);
+        if (i < 2) sleep_ms(off_ms);
+    }
+}
+
 // ================== Main ==================
 int main() {
     stdio_init_all();
@@ -129,10 +179,17 @@ int main() {
     bh1750_power_on(I2C_PORT);
     gy33_init();
 
+    // Buzzer
+    init_pwm(BUZZER);
+
     sleep_ms(200);
 
     // Cabeçalho CSV opcional
     printf("timestamp_ms,lux,r16,g16,b16,c16,r8,g8,b8,color\n");
+
+    // Estados de histerese (para disparar só na transição)
+    bool low_light_active = false;
+    bool red_intense_active = false;
 
     while (true) {
         // BH1750
@@ -141,24 +198,47 @@ int main() {
         // GY-33 (raw)
         gy33_read_raw((uint16_t*)&rgb_r16, (uint16_t*)&rgb_g16, (uint16_t*)&rgb_b16, (uint16_t*)&rgb_c16);
 
-        // Checa saturação grosseira (pode ajustar ganh/ATIME se necessário)
-        // if (rgb_r16 > 60000 || rgb_g16 > 60000 || rgb_b16 > 60000) { /* reduzir ganho/ATIME */ }
-
-        // Normalização por soma (R+G+B) → mais estável que usar C
+        // Normalização por soma (R+G+B)
         uint32_t sum = (uint32_t)rgb_r16 + (uint32_t)rgb_g16 + (uint32_t)rgb_b16;
         if (sum > 0) {
-            rgb_r8 = clamp_u8((int)((rgb_r16 * 255u) / sum * 3u)); // *3 para expandir a escala (soma ≈ 255*3)
+            rgb_r8 = clamp_u8((int)((rgb_r16 * 255u) / sum * 3u));
             rgb_g8 = clamp_u8((int)((rgb_g16 * 255u) / sum * 3u));
             rgb_b8 = clamp_u8((int)((rgb_b16 * 255u) / sum * 3u));
         } else {
             rgb_r8 = rgb_g8 = rgb_b8 = 0;
         }
 
-        // Classificação HSV
+        // Classificação HSV (nome da cor)
         const char* cname = classify_color_hsv(rgb_r8, rgb_g8, rgb_b8, lux_val, rgb_c16);
         snprintf((char*)cor_nome, sizeof(cor_nome), "%s", cname);
 
-        // Saída legível
+        // ===== Lógica de ALERTAS com buzzer =====
+        // 1) Baixa luminosidade (histerese simples)
+        if (!low_light_active && lux_val < LUX_LIMIT) {
+            low_light_active = true;
+            // bip único curto (880 Hz)
+            beep_once(BUZZER, 880, 500);
+        } else if (low_light_active && lux_val > (LUX_LIMIT + LUX_HYST)) {
+            low_light_active = false;
+        }
+
+        // 2) Vermelho intenso: nome "Vermelho" + S e V altos
+        float hr, sr, vr;
+        rgb_to_hsv(rgb_r8 / 255.0f, rgb_g8 / 255.0f, rgb_b8 / 255.0f, &hr, &sr, &vr);
+
+        bool is_red_name = (cname[0]=='V' && cname[1]=='e'); // "Vermelho" (barato e rápido)
+        bool red_is_intense = is_red_name && (sr >= 0.60f) && (vr >= 0.55f);
+
+        if (!red_intense_active && red_is_intense) {
+            red_intense_active = true;
+            // padrão triplo (1200 Hz) para destacar
+            beep_triple(BUZZER, 1200, 90, 70);
+        } else if (red_intense_active && (!is_red_name || (sr < 0.55f || vr < 0.50f))) {
+            // solta histerese para sair do estado
+            red_intense_active = false;
+        }
+
+        // ===== Saídas =====
         uint32_t ts = to_ms_since_boot(get_absolute_time());
         printf("[TS=%lums] Lux=%u lx | RAW R=%u G=%u B=%u C=%u | RGB8 R=%u G=%u B=%u | Cor=%s\n",
                (unsigned long)ts, lux_val,

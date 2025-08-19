@@ -38,7 +38,9 @@ add_subdirectory(lib/bh1750_light_sensor)
 
 # Add executable. Default name is the project name, version 0.1
 
-add_executable(sensor_cor_and_luminosidade sensor_cor_and_luminosidade.c )
+add_executable(sensor_cor_and_luminosidade sensor_cor_and_luminosidade.c
+lib/ssd1306/font.h
+lib/ssd1306/ssd1306.c)
 
 pico_set_program_name(sensor_cor_and_luminosidade "sensor_cor_and_luminosidade")
 pico_set_program_version(sensor_cor_and_luminosidade "0.1")
@@ -58,6 +60,7 @@ target_link_libraries(sensor_cor_and_luminosidade
         pico_stdlib
         bh1750_light_sensor
         hardware_pio
+        hardware_pwm
         )
 
 pico_generate_pio_header(sensor_cor_and_luminosidade ${CMAKE_CURRENT_LIST_DIR}/lib/animacoes_led.pio)

@@ -3,11 +3,14 @@
 #include <math.h>     // fmaxf, fminf
 #include "pico/stdlib.h"
 #include "hardware/i2c.h"
-#include "hardware/pio.h"
 #include "hardware/clocks.h"
-#include "animacoes_led.pio.h" // Animações LEDs PIO
+#include "animacoes_led.pio.h" // Animaï¿½ï¿½es LEDs PIO
+#include "hardware/gpio.h"   // <â€” novo (buzzer)
+#include "hardware/pwm.h"    // <â€” novo (buzzer)
 #include "bh1750_light_sensor.h"
 #include "lib/config_btn.h"
+#include "lib/ssd1306/font.h"
+#include "lib/ssd1306/ssd1306.h"
 
 // ====================== I2C ======================
 #define I2C_PORT i2c0
@@ -15,30 +18,30 @@
 #define I2C_SCL  1
 
 // ====================== Matriz de Leds ======================
-#define NUM_PIXELS 25          // Número de LEDs na matriz
-#define matriz_leds 7          // Pino de saída para matriz
+#define NUM_PIXELS 25          // Nï¿½mero de LEDs na matriz
+#define matriz_leds 7          // Pino de saï¿½da para matriz
 
-// ====================== Definição de Pinos ======================
+// ====================== Definiï¿½ï¿½o de Pinos ======================
 const uint BTN_A_PIN = 5;  // Pino para o BotÃ£o A
 const uint RED_PIN = 13;   // Pino para o LED vermelho
 const uint GREEN_PIN = 11; // Pino para o LED verde
 const uint BLUE_PIN = 12;  // Pino para o LED azul
 
-// ====================== Variáveis Globais ======================
+// ====================== Variï¿½veis Globais ======================
 PIO pio;                      // Controlador PIO
 uint sm;                      // State Machine do PIO
-uint contagem = 0;            // Número a ser exibido na matriz
+uint contagem = 0;            // Nï¿½mero a ser exibido na matriz
 uint16_t r, g, b, c;
 uint16_t rp, gp, bp;
 
-// ====================== Variáveis de Controle ======================
+// ====================== Variï¿½veis de Controle ======================
 volatile int led_state = 0;            // 0=Vermelho, 1=Verde, 2=Azul
 volatile uint32_t last_press_time = 0; // Armazena o tempo do Ãºltimo aperto para o debounce
 
-// ====================== Interrupção Botão A ======================
+// ====================== Interrupï¿½ï¿½o Botï¿½o A ======================
 void bta_gpio_irq_handler(uint gpio, uint32_t events)
 {
-    // Verifica se o botão A foi presionado
+    // Verifica se o botï¿½o A foi presionado
     if (gpio == BTN_A_PIN)
     {
 
@@ -63,7 +66,13 @@ void bta_gpio_irq_handler(uint gpio, uint32_t events)
     }
 }
 
-// Endereços
+// Endereï¿½os
+// ====================== I2C1 (DISPLAY) ======================
+
+#define I2C_PORT_DISPLAY i2c1
+#define I2C_DISPLAY_SDA 14
+#define I2C_DISPLAY_SCL 15
+
 #define BH1750_ADDR 0x23
 #define GY33_ADDR   0x29
 
@@ -76,11 +85,17 @@ void bta_gpio_irq_handler(uint gpio, uint32_t events)
 #define GDATA_REG    0x98
 #define BDATA_REG    0x9A
 
+// ================== Buzzer (PWM) ==================
+#define BUZZER      21
+#define LUX_LIMIT   15     // limite para alerta de baixa luz (ajuste conforme seu ambiente)
+#define LUX_HYST    3      // histerese para sair do estado de alerta
+
 // ================== VariÃ¡veis globais ==================
 volatile uint16_t rgb_r16 = 0, rgb_g16 = 0, rgb_b16 = 0, rgb_c16 = 0;
 volatile uint8_t  rgb_r8 = 0, rgb_g8 = 0, rgb_b8 = 0; // normalizado por (R+G+B)
 volatile uint16_t lux_val = 0;
 volatile char cor_nome[12] = "Indefinido";
+ssd1306_t ssd;
 
 // ================== Utils ==================
 static inline uint8_t clamp_u8(int v) {
@@ -163,9 +178,9 @@ static void gy33_read_raw(uint16_t* r, uint16_t* g, uint16_t* b, uint16_t* c) {
     *b = gy33_read_register16(BDATA_REG);
 }
 
-// Função para converter RGB decimal para uint32_t no formato RGBA
+// Funï¿½ï¿½o para converter RGB decimal para uint32_t no formato RGBA
     uint32_t rgb_para_hex(int R, int G, int B, int P) {
-        // Garante que os valores estão no range 0-255
+        // Garante que os valores estï¿½o no range 0-255
         R = (R < 0) ? 0 : (R > 255) ? 255 : R;
         G = (G < 0) ? 0 : (G > 255) ? 255 : G;
         B = (B < 0) ? 0 : (B > 255) ? 255 : B;
@@ -175,7 +190,7 @@ static void gy33_read_raw(uint16_t* r, uint16_t* g, uint16_t* b, uint16_t* c) {
         return ((uint32_t)G << 24) | ((uint32_t)R << 16) | ((uint32_t)B << 8) | (uint32_t)P;
     }
 
-// Função que muda a cor da matriz de Leds
+// Funï¿½ï¿½o que muda a cor da matriz de Leds
 void Cores_matriz_leds(){
 
     rp = (uint16_t) rgb_r16 * (lux_val / 2000.0);
@@ -188,6 +203,47 @@ void Cores_matriz_leds(){
     for (int i = 0; i < NUM_PIXELS; i++) {
            
         pio_sm_put_blocking(pio, sm, cor_rgb);
+
+// ================== Buzzer: funÃ§Ãµes PWM ==================
+static void init_pwm(uint gpio) {
+    gpio_set_function(gpio, GPIO_FUNC_PWM);
+    uint slice_num = pwm_gpio_to_slice_num(gpio);
+    pwm_set_clkdiv(slice_num, 125.0f);        // base 1 MHz
+    pwm_set_wrap(slice_num, 1000);            // TOP 1000 => 1 kHz default
+    pwm_set_chan_level(slice_num, pwm_gpio_to_channel(gpio), 0);
+    pwm_set_enabled(slice_num, true);
+}
+
+static void set_buzzer_tone(uint gpio, uint freq) {
+    uint slice_num = pwm_gpio_to_slice_num(gpio);
+    if (freq == 0) { // proteÃ§Ã£o
+        pwm_set_chan_level(slice_num, pwm_gpio_to_channel(gpio), 0);
+        return;
+    }
+    uint top = 1000000 / freq;                // 1 MHz / freq
+    if (top < 10) top = 10;                   // evita TOP muito baixo
+    pwm_set_wrap(slice_num, top);
+    pwm_set_chan_level(slice_num, pwm_gpio_to_channel(gpio), top / 2); // 50% duty
+}
+
+static void stop_buzzer(uint gpio) {
+    uint slice_num = pwm_gpio_to_slice_num(gpio);
+    pwm_set_chan_level(slice_num, pwm_gpio_to_channel(gpio), 0);
+}
+
+// pequenos helpers de padrÃ£o sonoro (bloqueantes, curtos)
+static void beep_once(uint gpio, uint freq, uint ms) {
+    set_buzzer_tone(gpio, freq);
+    sleep_ms(ms);
+    stop_buzzer(gpio);
+}
+
+static void beep_triple(uint gpio, uint freq, uint on_ms, uint off_ms) {
+    for (int i = 0; i < 3; i++) {
+        set_buzzer_tone(gpio, freq);
+        sleep_ms(on_ms);
+        stop_buzzer(gpio);
+        if (i < 2) sleep_ms(off_ms);
     }
 }
 
@@ -198,7 +254,7 @@ int main() {
 
     init_btn_callback();
 
-    // Configurações dos pinos GPIO do LED RGB
+    // Configuraï¿½ï¿½es dos pinos GPIO do LED RGB
     gpio_init(RED_PIN);
     gpio_init(GREEN_PIN);
     gpio_init(BLUE_PIN);
@@ -207,15 +263,15 @@ int main() {
     gpio_set_dir(GREEN_PIN, GPIO_OUT);
     gpio_set_dir(BLUE_PIN, GPIO_OUT);
 
-    // --- Inicialização do Pino do Botão ---
+    // --- Inicializaï¿½ï¿½o do Pino do Botï¿½o ---
     gpio_init(BTN_A_PIN);
     gpio_set_dir(BTN_A_PIN, GPIO_IN);
     gpio_pull_up(BTN_A_PIN); // Usa o resistor de pull-up interno
 
-    // --- ConfiguraÃ§Ã£o da Interrupção ---
+    // --- ConfiguraÃ§Ã£o da Interrupï¿½ï¿½o ---
     gpio_set_irq_enabled_with_callback(BTN_A_PIN, GPIO_IRQ_EDGE_FALL, true, &bta_gpio_irq_handler);
 
-    // Inicialização PIO para matriz de LEDs
+    // Inicializaï¿½ï¿½o PIO para matriz de LEDs
     pio = pio0;
     uint offset = pio_add_program(pio, &animacoes_led_program);
     sm = pio_claim_unused_sm(pio, true);
@@ -228,14 +284,35 @@ int main() {
     gpio_pull_up(I2C_SDA);
     gpio_pull_up(I2C_SCL);
 
+    // I2C1 DISPLAY
+    i2c_init(I2C_PORT_DISPLAY, 400 * 1000);
+    gpio_set_function(I2C_DISPLAY_SDA, GPIO_FUNC_I2C);
+    gpio_set_function(I2C_DISPLAY_SCL, GPIO_FUNC_I2C);
+    gpio_pull_up(I2C_DISPLAY_SDA);
+    gpio_pull_up(I2C_DISPLAY_SCL);
+
     // Sensores
     bh1750_power_on(I2C_PORT);
     gy33_init();
 
+
+    // Buzzer
+    init_pwm(BUZZER);
+
+    // DISPLAY
+    ssd1306_init(&ssd, 128, 64, false, 0x3C, I2C_PORT_DISPLAY);
+    ssd1306_config(&ssd);
+    ssd1306_fill(&ssd, 0);
+    ssd1306_send_data(&ssd);
+
     sleep_ms(200);
 
-    // Cabeçalho CSV opcional
+    // Cabeï¿½alho CSV opcional
     printf("timestamp_ms,lux,r16,g16,b16,c16,r8,g8,b8,color\n");
+
+    // Estados de histerese (para disparar sÃ³ na transiÃ§Ã£o)
+    bool low_light_active = false;
+    bool red_intense_active = false;
 
     while (true) {
 
@@ -279,24 +356,47 @@ int main() {
         // GY-33 (raw)
         gy33_read_raw((uint16_t*)&rgb_r16, (uint16_t*)&rgb_g16, (uint16_t*)&rgb_b16, (uint16_t*)&rgb_c16);
 
-        // Checa saturaÃ§Ã£o grosseira (pode ajustar ganh/ATIME se necessÃ¡rio)
-        // if (rgb_r16 > 60000 || rgb_g16 > 60000 || rgb_b16 > 60000) { /* reduzir ganho/ATIME */ }
-
-        // NormalizaÃ§Ã£o por soma (R+G+B) â†’ mais estÃ¡vel que usar C
+        // NormalizaÃ§Ã£o por soma (R+G+B)
         uint32_t sum = (uint32_t)rgb_r16 + (uint32_t)rgb_g16 + (uint32_t)rgb_b16;
         if (sum > 0) {
-            rgb_r8 = clamp_u8((int)((rgb_r16 * 255u) / sum * 3u)); // *3 para expandir a escala (soma â‰ˆ 255*3)
+            rgb_r8 = clamp_u8((int)((rgb_r16 * 255u) / sum * 3u));
             rgb_g8 = clamp_u8((int)((rgb_g16 * 255u) / sum * 3u));
             rgb_b8 = clamp_u8((int)((rgb_b16 * 255u) / sum * 3u));
         } else {
             rgb_r8 = rgb_g8 = rgb_b8 = 0;
         }
 
-        // ClassificaÃ§Ã£o HSV
+        // ClassificaÃ§Ã£o HSV (nome da cor)
         const char* cname = classify_color_hsv(rgb_r8, rgb_g8, rgb_b8, lux_val, rgb_c16);
         snprintf((char*)cor_nome, sizeof(cor_nome), "%s", cname);
 
-        // SaÃ­da legÃ­vel
+        // ===== LÃ³gica de ALERTAS com buzzer =====
+        // 1) Baixa luminosidade (histerese simples)
+        if (!low_light_active && lux_val < LUX_LIMIT) {
+            low_light_active = true;
+            // bip Ãºnico curto (880 Hz)
+            beep_once(BUZZER, 880, 500);
+        } else if (low_light_active && lux_val > (LUX_LIMIT + LUX_HYST)) {
+            low_light_active = false;
+        }
+
+        // 2) Vermelho intenso: nome "Vermelho" + S e V altos
+        float hr, sr, vr;
+        rgb_to_hsv(rgb_r8 / 255.0f, rgb_g8 / 255.0f, rgb_b8 / 255.0f, &hr, &sr, &vr);
+
+        bool is_red_name = (cname[0]=='V' && cname[1]=='e'); // "Vermelho" (barato e rÃ¡pido)
+        bool red_is_intense = is_red_name && (sr >= 0.60f) && (vr >= 0.55f);
+
+        if (!red_intense_active && red_is_intense) {
+            red_intense_active = true;
+            // padrÃ£o triplo (1200 Hz) para destacar
+            beep_triple(BUZZER, 1200, 90, 70);
+        } else if (red_intense_active && (!is_red_name || (sr < 0.55f || vr < 0.50f))) {
+            // solta histerese para sair do estado
+            red_intense_active = false;
+        }
+
+        // ===== SaÃ­das =====
         uint32_t ts = to_ms_since_boot(get_absolute_time());
         printf("[TS=%lums] Lux=%u lx | RAW R=%u G=%u B=%u C=%u | RGB8 R=%u G=%u B=%u | Cor=%s\n",
                (unsigned long)ts, lux_val,
@@ -310,6 +410,30 @@ int main() {
                rgb_r8, rgb_g8, rgb_b8, cor_nome);
 
         sleep_ms(200);
+    
+        //Leitura sensores
+        uint16_t lux_val = bh1750_read_measurement(I2C_PORT);
+
+        uint16_t r, g, b, c;
+        gy33_read_raw(&r, &g, &b, &c);
+
+        //Display
+        ssd1306_fill(&ssd, 0);
+        char buf[32];
+
+        snprintf(buf, sizeof(buf), "Lux: %u lx", lux_val);
+        ssd1306_draw_string(&ssd, buf, 0, 0);
+        snprintf(buf, sizeof(buf), "R:%u G:%u", r, g);
+        ssd1306_draw_string(&ssd, buf, 0, 16);
+        snprintf(buf, sizeof(buf), "B:%u", b);
+        ssd1306_draw_string(&ssd, buf, 0, 28);
+        snprintf(buf, sizeof(buf), "Cor: %s", cor_nome);
+        ssd1306_draw_string(&ssd, buf, 0, 44);
+        ssd1306_send_data(&ssd);
+
+        sleep_ms(500);
     }
+
+    
     return 0;
-}
+}   

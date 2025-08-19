@@ -15,7 +15,7 @@
 #define I2C_SDA  0
 #define I2C_SCL  1
 
-// ====================== I2C1 (DISPLAY) ======================
+// ================= I2C1 (DISPLAY) ==================
 
 #define I2C_PORT_DISPLAY i2c1
 #define I2C_DISPLAY_SDA 14

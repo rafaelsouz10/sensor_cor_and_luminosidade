@@ -59,8 +59,12 @@ target_include_directories(sensor_cor_and_luminosidade PRIVATE
 target_link_libraries(sensor_cor_and_luminosidade 
         pico_stdlib
         bh1750_light_sensor
+        hardware_pio
         hardware_pwm
         )
 
+pico_generate_pio_header(sensor_cor_and_luminosidade ${CMAKE_CURRENT_LIST_DIR}/lib/animacoes_led.pio)
+
 pico_add_extra_outputs(sensor_cor_and_luminosidade)
+
 
